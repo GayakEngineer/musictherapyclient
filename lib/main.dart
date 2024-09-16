@@ -1,10 +1,14 @@
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:provider/provider.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:internet_connection_checker/internet_connection_checker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
+void main() async{
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   runApp(const MyApp());
 }
 
@@ -84,13 +88,37 @@ class _LoginPageState extends State<LoginPage> {
   final TextEditingController _pinController = TextEditingController();
   String error = '';
 
-  void _login()async {
-     SharedPreferences prefs = await SharedPreferences.getInstance();
-     await prefs.setBool('isLoggedIn', true); 
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(builder: (_) => const HomePage()),
-    );
+  // Function to check if user exists in Firestore
+  Future<bool> _checkUserExists(String userID) async {
+    final FirebaseFirestore firestore = FirebaseFirestore.instance;
+    DocumentSnapshot doc = await firestore.collection('users').doc(userID).get();
+
+    // Return true if the document exists, false otherwise
+    return doc.exists;
+  }
+
+  void _login() async {
+    String userID = _pinController.text.trim();
+
+    // Check if the entered userID exists in Firestore
+    bool userExists = await _checkUserExists(userID);
+
+    if (userExists) {
+      SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('isLoggedIn', true);
+      await prefs.setString('userID', userID);
+
+      // Navigate to HomePage if user exists
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const HomePage()),
+      );
+    } else {
+      // Show error if user doesn't exist
+      setState(() {
+        error = 'Invalid PIN: No user found with this ID';
+      });
+    }
   }
 
   @override
@@ -111,7 +139,7 @@ class _LoginPageState extends State<LoginPage> {
               keyboardType: TextInputType.number,
               obscureText: true,
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 45),
             ElevatedButton(onPressed: _login, child: const Text('Login')),
           ],
         ),
@@ -120,14 +148,77 @@ class _LoginPageState extends State<LoginPage> {
   }
 }
 
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  late DocumentSnapshot documentSnapshot;
+ bool isLoading = true;
+ bool expired=false;
+  late String expiryStatus;
+  
+  @override
+  void initState() {
+    super.initState();
+    getData();
+  }
+  void dateCalc()async{
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+              
+    
+    if (documentSnapshot.exists) {
+      DateTime expiryDate = documentSnapshot.get('expiry_date').toDate();
+      int daysRemaining = expiryDate.difference(DateTime.now()).inDays;
+
+      if (daysRemaining < 0) {
+        expiryStatus = 'Audio expired';
+        await prefs.setBool('expired', true);
+      } else if (daysRemaining == 0) {
+        expiryStatus = 'Audio expires today';
+        await prefs.setBool('expired', false);
+      } else {
+        expiryStatus = '$daysRemaining';
+        await prefs.setBool('expired', false);
+      }
+    } else {
+      expiryStatus = 'No data available';
+    }
+          }
+
+  void getData() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String userID=prefs.getString('userID')??'0000';
+    expired=prefs.getBool('expired')??false;
+    final FirebaseFirestore firestore = FirebaseFirestore.instance;
+    try {
+      // Fetch document from Firestore
+      documentSnapshot = await firestore.collection('users').doc(userID).get();
+
+      dateCalc();
+    } catch (e) {
+      print('Error fetching data: $e');
+    } finally {
+      // Stop loading once the data is fetched
+      setState(() {
+        isLoading = false;
+      });
+    }
+  }
+  
 
   @override
   Widget build(BuildContext context) {
     final internetStatus = Provider.of<InternetConnectionStatus>(context);
     bool isConnected = internetStatus == InternetConnectionStatus.connected;
-
+    if (isLoading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         title: const Text('Home'),
@@ -136,7 +227,8 @@ class HomePage extends StatelessWidget {
             icon: const Icon(Icons.logout),
             onPressed: ()async {
               SharedPreferences prefs = await SharedPreferences.getInstance();
-              await prefs.remove('isLoggedIn'); 
+              await prefs.remove('isLoggedIn');
+              await prefs.remove('userID');
               Navigator.pushReplacement(
                 context,
                 MaterialPageRoute(builder: (_) => const LoginPage()),
@@ -149,103 +241,261 @@ class HomePage extends StatelessWidget {
         children: [
           Padding(
             padding: const EdgeInsets.all(16.0),
-            child: Column(
+            child:!expired? Column(
               children: [
-                MorningAudioContainer(
-                    title: 'Morning', isConnected: isConnected),
-                AfternoonAudioContainer(
-                    title: 'Afternoon', isConnected: isConnected),
-                EveningAudioContainer(
-                    title: 'Evening', isConnected: isConnected),
-                NightAudioContainer(title: 'Night', isConnected: isConnected),
+                !documentSnapshot.get('morningempty')?MorningAudioContainer(
+                    title: 'Morning', isConnected: isConnected):const SizedBox(),
+                !documentSnapshot.get('afternoonempty')?AfternoonAudioContainer(
+                    title: 'Afternoon', isConnected: isConnected):const SizedBox(),
+                !documentSnapshot.get('eveningempty')?EveningAudioContainer(
+                    title: 'Evening', isConnected: isConnected):const SizedBox(),
+                !documentSnapshot.get('nightempty')?NightAudioContainer(title: 'Night', isConnected: isConnected):const SizedBox(),
               ],
-            ),
+            ): const Center(child: Text("Audios expired. Ask admin to renew audios"),),
           ),
-          const Text("Expiry Date")
+          Text("Days left : $expiryStatus", style: const TextStyle(fontSize: 16),)
         ],
       ),
     );
   }
 }
 
-class MorningAudioContainer extends StatelessWidget {
+class MorningAudioContainer extends StatefulWidget {
   final String title;
   final bool isConnected;
-  MorningAudioContainer(
-      {super.key, required this.title, required this.isConnected});
+
+  const MorningAudioContainer({
+    super.key,
+    required this.title,
+    required this.isConnected,
+  });
+
+  @override
+  _MorningAudioContainerState createState() => _MorningAudioContainerState();
+}
+
+class _MorningAudioContainerState extends State<MorningAudioContainer> {
+  Future<DocumentSnapshot> getData() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String userID = prefs.getString('userID') ?? '0000';
+    final FirebaseFirestore firestore = FirebaseFirestore.instance;
+
+    try {
+      // Fetch document from Firestore
+      return await firestore.collection('users').doc(userID).get();
+    } catch (e) {
+      print('Error fetching data: $e');
+      rethrow; // Rethrow the error to handle it in FutureBuilder
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final audioPlayerModel = Provider.of<MorningAudioPlayerModel>(context);
     final player = audioPlayerModel.audioPlayer;
-    player.setUrl(
-        'https://file.notion.so/f/f/03eb2569-ebdb-4a4d-8f90-c73374d805cc/d89230a3-c4db-494b-b71f-13908d9f72f1/Addha_Teental.mp3?table=block&id=103ab9a5-784f-806b-ac55-fd6fda3fb425&spaceId=03eb2569-ebdb-4a4d-8f90-c73374d805cc&expirationTimestamp=1726574400000&signature=QBOene20qkXzKTS5EUu5SF9NY7qNO9azDJmENK1Jspo', preload: true);
 
-    return AudioPlayerUI(
-      title: title,
-      player: player,
-      isConnected: isConnected,
+    return FutureBuilder<DocumentSnapshot>(
+      future: getData(),
+      builder: (BuildContext context, AsyncSnapshot<DocumentSnapshot> snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        } else if (snapshot.hasError) {
+          return const Text('Error loading audio');
+        } else if (!snapshot.hasData || !snapshot.data!.exists) {
+          return const Text('No audio data available');
+        }
+
+        final documentSnapshot = snapshot.data!;
+        if (documentSnapshot.exists) {
+          player.setUrl(documentSnapshot.get('morning'), preload: true);
+        }
+
+        return AudioPlayerUI(
+          title: widget.title,
+          player: player,
+          isConnected: widget.isConnected,
+        );
+      },
     );
   }
 }
 
-class AfternoonAudioContainer extends StatelessWidget {
+class AfternoonAudioContainer extends StatefulWidget {
   final String title;
   final bool isConnected;
-  AfternoonAudioContainer(
-      {super.key, required this.title, required this.isConnected});
+
+  const AfternoonAudioContainer({
+    super.key,
+    required this.title,
+    required this.isConnected,
+  });
+
+  @override
+  _AfternoonAudioContainerState createState() => _AfternoonAudioContainerState();
+}
+
+class _AfternoonAudioContainerState extends State<AfternoonAudioContainer> {
+  Future<DocumentSnapshot> getData() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String userID = prefs.getString('userID') ?? '0000';
+    final FirebaseFirestore firestore = FirebaseFirestore.instance;
+
+    try {
+      // Fetch document from Firestore
+      return await firestore.collection('users').doc(userID).get();
+    } catch (e) {
+      print('Error fetching data: $e');
+      throw e; // Rethrow the error to handle it in FutureBuilder
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final audioPlayerModel = Provider.of<AfternoonAudioPlayerModel>(context);
     final player = audioPlayerModel.audioPlayer;
-    player.setUrl(
-        'https://file.notion.so/f/f/03eb2569-ebdb-4a4d-8f90-c73374d805cc/411bf95d-f2da-48f4-931b-6224b787ab49/Ghazal_Taal.m4a?table=block&id=103ab9a5-784f-80ac-9f50-c1503b759878&spaceId=03eb2569-ebdb-4a4d-8f90-c73374d805cc&expirationTimestamp=1726574400000&signature=QYMh_nSCd9avcqGccR_c8G8n_At00RTHTvZp4GJ6POg', preload: true);
 
-    return AudioPlayerUI(
-      title: title,
-      player: player,
-      isConnected: isConnected,
+    return FutureBuilder<DocumentSnapshot>(
+      future: getData(),
+      builder: (BuildContext context, AsyncSnapshot<DocumentSnapshot> snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        } else if (snapshot.hasError) {
+          return const Text('Error loading audio');
+        } else if (!snapshot.hasData || !snapshot.data!.exists) {
+          return const Text('No audio data available');
+        }
+
+        final documentSnapshot = snapshot.data!;
+        if (documentSnapshot.exists) {
+          player.setUrl(documentSnapshot.get('afternoon'), preload: true);
+        }
+
+        return AudioPlayerUI(
+          title: widget.title,
+          player: player,
+          isConnected: widget.isConnected,
+        );
+      },
     );
   }
 }
 
-class EveningAudioContainer extends StatelessWidget {
+class EveningAudioContainer extends StatefulWidget {
   final String title;
   final bool isConnected;
-  EveningAudioContainer(
-      {super.key, required this.title, required this.isConnected});
+
+  const EveningAudioContainer({
+    super.key,
+    required this.title,
+    required this.isConnected,
+  });
+
+  @override
+  _EveningAudioContainerState createState() => _EveningAudioContainerState();
+}
+
+class _EveningAudioContainerState extends State<EveningAudioContainer> {
+  Future<DocumentSnapshot> getData() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String userID = prefs.getString('userID') ?? '0000';
+    final FirebaseFirestore firestore = FirebaseFirestore.instance;
+
+    try {
+      // Fetch document from Firestore
+      return await firestore.collection('users').doc(userID).get();
+    } catch (e) {
+      print('Error fetching data: $e');
+      throw e; // Rethrow the error to handle it in FutureBuilder
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final audioPlayerModel = Provider.of<EveningAudioPlayerModel>(context);
     final player = audioPlayerModel.audioPlayer;
-    player.setUrl(
-        '', preload: true);
 
-    return AudioPlayerUI(
-      title: title,
-      player: player,
-      isConnected: isConnected,
+    return FutureBuilder<DocumentSnapshot>(
+      future: getData(),
+      builder: (BuildContext context, AsyncSnapshot<DocumentSnapshot> snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        } else if (snapshot.hasError) {
+          return const Text('Error loading audio');
+        } else if (!snapshot.hasData || !snapshot.data!.exists) {
+          return const Text('No audio data available');
+        }
+
+        final documentSnapshot = snapshot.data!;
+        if (documentSnapshot.exists) {
+          player.setUrl(documentSnapshot.get('evening'), preload: true);
+        }
+
+        return AudioPlayerUI(
+          title: widget.title,
+          player: player,
+          isConnected: widget.isConnected,
+        );
+      },
     );
   }
 }
 
-class NightAudioContainer extends StatelessWidget {
+class NightAudioContainer extends StatefulWidget {
   final String title;
   final bool isConnected;
-  NightAudioContainer(
-      {super.key, required this.title, required this.isConnected});
+
+  const NightAudioContainer({
+    super.key,
+    required this.title,
+    required this.isConnected,
+  });
+
+  @override
+  _NightAudioContainerState createState() => _NightAudioContainerState();
+}
+
+class _NightAudioContainerState extends State<NightAudioContainer> {
+  Future<DocumentSnapshot> getData() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String userID = prefs.getString('userID') ?? '0000';
+    final FirebaseFirestore firestore = FirebaseFirestore.instance;
+
+    try {
+      // Fetch document from Firestore
+      return await firestore.collection('users').doc(userID).get();
+    } catch (e) {
+      print('Error fetching data: $e');
+      throw e; // Rethrow the error to handle it in FutureBuilder
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final audioPlayerModel = Provider.of<NightAudioPlayerModel>(context);
     final player = audioPlayerModel.audioPlayer;
 
-    return AudioPlayerUI(
-      title: title,
-      player: player,
-      isConnected: isConnected,
+    return FutureBuilder<DocumentSnapshot>(
+      future: getData(),
+      builder: (BuildContext context, AsyncSnapshot<DocumentSnapshot> snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        } else if (snapshot.hasError) {
+          return const Text('Error loading audio');
+        } else if (!snapshot.hasData || !snapshot.data!.exists) {
+          return const Text('No audio data available');
+        }
+
+        final documentSnapshot = snapshot.data!;
+        if (documentSnapshot.exists) {
+          player.setUrl(documentSnapshot.get('night'), preload: true);
+        }
+
+        return AudioPlayerUI(
+          title: widget.title,
+          player: player,
+          isConnected: widget.isConnected,
+        );
+      },
     );
   }
 }
@@ -254,7 +504,7 @@ class AudioPlayerUI extends StatelessWidget {
   final String title;
   final AudioPlayer player;
   final bool isConnected;
-  AudioPlayerUI(
+  const AudioPlayerUI(
       {super.key,
       required this.title,
       required this.player,
@@ -276,7 +526,7 @@ class AudioPlayerUI extends StatelessWidget {
               padding: EdgeInsets.all(8.0),
               child: Row(
                 children: [
-                  Icon(Icons.warning_amber),
+                  Icon(Icons.warning_amber, color: Color(0xFFfc3503),),
                   Text("No internet connection!"),
                 ],
               ),
